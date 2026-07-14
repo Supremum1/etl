@@ -178,7 +178,7 @@ ClickHouse принимает данные через Native Protocol повер
 
 ### Влияние Native TCP и драйверов
 
-После v4 отдельного `serialize_ms` нет: сериализация выполняется внутри драйвера и входит в `load_ms`. Поэтому сравнивается сумма `serialize_ms + load_ms` в v2 с `load_ms` в v4:
+После v2 отдельного `serialize_ms` нет: сериализация выполняется внутри драйвера и входит в `load_ms`. Поэтому сравнивается сумма `serialize_ms + load_ms` в v1 с `load_ms` в v2:
 
 | Реализация | v1: serialize + load | v2: native load | Изменение |
 |---|---:|---:|---:|
