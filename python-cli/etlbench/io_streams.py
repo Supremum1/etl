@@ -38,13 +38,7 @@ def find_default_file(dataset: str, data_dir: Path) -> Path:
 
 def iter_csv(path: Path, delimiter: str | None = None) -> tuple[list[str], Iterator[list[str | None]]]:
     handle = path.open("r", newline="", encoding="utf-8-sig")
-    sample = handle.read(65536)
-    handle.seek(0)
-    if delimiter is None:
-        dialect = csv.Sniffer().sniff(sample) if sample else csv.excel
-        reader = csv.reader(handle, dialect)
-    else:
-        reader = csv.reader(handle, delimiter=delimiter)
+    reader = csv.reader(handle, delimiter=delimiter or ",")
     headers = next(reader)
 
     def rows() -> Iterator[list[str | None]]:

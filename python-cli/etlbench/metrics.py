@@ -16,6 +16,8 @@ from etlbench.config import ClickHouseConfig
 
 @dataclass
 class BenchmarkMetrics:
+    benchmark_version: int = 2
+    benchmark_mode: str = "full"
     run_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     implementation: str = "python"
     dataset: str = ""
@@ -29,9 +31,13 @@ class BenchmarkMetrics:
     batch_size: int = 0
     batch_count: int = 0
     prepare_ms: float = 0.0
+    source_verify_ms: float = 0.0
+    target_setup_ms: float = 0.0
     extract_ms: float = 0.0
+    serialize_ms: float = 0.0
     load_ms: float = 0.0
     verify_ms: float = 0.0
+    overhead_ms: float = 0.0
     total_ms: float = 0.0
     rows_per_sec: float = 0.0
     mb_per_sec: float = 0.0
@@ -93,6 +99,8 @@ def insert_metrics(config: ClickHouseConfig, metrics: BenchmarkMetrics) -> None:
         f"""
         CREATE TABLE IF NOT EXISTS {config.database}.benchmark_runs
         (
+            benchmark_version UInt16 DEFAULT 2,
+            benchmark_mode LowCardinality(String),
             run_id UUID,
             measured_at DateTime64(3, 'UTC') DEFAULT now64(3),
             implementation LowCardinality(String),
@@ -107,9 +115,13 @@ def insert_metrics(config: ClickHouseConfig, metrics: BenchmarkMetrics) -> None:
             batch_size UInt32,
             batch_count UInt64,
             prepare_ms Float64,
+            source_verify_ms Float64,
+            target_setup_ms Float64,
             extract_ms Float64,
+            serialize_ms Float64,
             load_ms Float64,
             verify_ms Float64,
+            overhead_ms Float64,
             total_ms Float64,
             rows_per_sec Float64,
             mb_per_sec Float64,
@@ -121,8 +133,23 @@ def insert_metrics(config: ClickHouseConfig, metrics: BenchmarkMetrics) -> None:
         ORDER BY (dataset, implementation, measured_at, run_id)
         """
     )
+    client.command(
+        f"ALTER TABLE {config.database}.benchmark_runs "
+        "ADD COLUMN IF NOT EXISTS benchmark_version UInt16 DEFAULT 1"
+    )
+    client.command(
+        f"ALTER TABLE {config.database}.benchmark_runs "
+        "ADD COLUMN IF NOT EXISTS benchmark_mode LowCardinality(String) DEFAULT 'legacy'"
+    )
+    for column in ("source_verify_ms", "target_setup_ms", "serialize_ms", "overhead_ms"):
+        client.command(
+            f"ALTER TABLE {config.database}.benchmark_runs "
+            f"ADD COLUMN IF NOT EXISTS {column} Float64 DEFAULT 0"
+        )
     data = asdict(metrics)
     ordered = [
+        "benchmark_version",
+        "benchmark_mode",
         "run_id",
         "implementation",
         "dataset",
@@ -136,9 +163,13 @@ def insert_metrics(config: ClickHouseConfig, metrics: BenchmarkMetrics) -> None:
         "batch_size",
         "batch_count",
         "prepare_ms",
+        "source_verify_ms",
+        "target_setup_ms",
         "extract_ms",
+        "serialize_ms",
         "load_ms",
         "verify_ms",
+        "overhead_ms",
         "total_ms",
         "rows_per_sec",
         "mb_per_sec",

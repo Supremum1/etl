@@ -8,7 +8,7 @@ from pathlib import Path
 from etlbench.config import ClickHouseConfig, PostgresConfig
 from etlbench.identifiers import require_dataset
 from etlbench.io_streams import find_default_file
-from etlbench.metrics import BenchmarkMetrics
+from etlbench.metrics import BenchmarkMetrics, MemorySampler, now_ms, process_cpu_ms
 from etlbench.source_loader import prepare_postgres_source
 from etlbench.transfer import transfer_postgres_to_clickhouse
 
@@ -18,7 +18,7 @@ def add_common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--file", type=Path, help="CSV/XLSX source file. Defaults to data/input/<dataset>.*")
     parser.add_argument("--data-dir", type=Path, default=Path("data/input"))
     parser.add_argument("--sheet", help="XLSX sheet name. Defaults to the first sheet.")
-    parser.add_argument("--delimiter", help="CSV delimiter. Defaults to dialect sniffing.")
+    parser.add_argument("--delimiter", help="CSV delimiter. Defaults to comma.")
     parser.add_argument("--fetch-size", type=int, default=50_000)
     parser.add_argument("--batch-size", type=int, default=50_000)
     parser.add_argument("--limit-rows", type=int, help="Prepare only the first N input rows. Useful for smoke tests.")
@@ -72,28 +72,34 @@ def command_run(args: argparse.Namespace) -> None:
     dataset = require_dataset(args.dataset)
     input_file = resolve_file(args)
     metrics = BenchmarkMetrics(implementation="python-cli", dataset=dataset)
-    _, fmt, _ = prepare_postgres_source(
-        pg_config=PostgresConfig(),
-        dataset=dataset,
-        input_file=input_file,
-        sheet=args.sheet,
-        delimiter=args.delimiter,
-        truncate=True,
-        limit_rows=args.limit_rows,
-        metrics=metrics,
-    )
-    metrics = transfer_postgres_to_clickhouse(
-        pg_config=PostgresConfig(),
-        ch_config=ClickHouseConfig(),
-        dataset=dataset,
-        implementation="python-cli",
-        fetch_size=args.fetch_size,
-        batch_size=args.batch_size,
-        input_file=input_file,
-        file_format=fmt,
-        truncate_target=not args.keep_target,
-        inherited_metrics=metrics,
-    )
+    total_started = now_ms()
+    cpu_started = process_cpu_ms()
+    with MemorySampler() as sampler:
+        _, fmt, _ = prepare_postgres_source(
+            pg_config=PostgresConfig(),
+            dataset=dataset,
+            input_file=input_file,
+            sheet=args.sheet,
+            delimiter=args.delimiter,
+            truncate=True,
+            limit_rows=args.limit_rows,
+            metrics=metrics,
+        )
+        metrics = transfer_postgres_to_clickhouse(
+            pg_config=PostgresConfig(),
+            ch_config=ClickHouseConfig(),
+            dataset=dataset,
+            implementation="python-cli",
+            fetch_size=args.fetch_size,
+            batch_size=args.batch_size,
+            input_file=input_file,
+            file_format=fmt,
+            truncate_target=not args.keep_target,
+            inherited_metrics=metrics,
+            cpu_started=cpu_started,
+            total_started=total_started,
+            memory_sampler=sampler,
+        )
     print(json.dumps(asdict(metrics), ensure_ascii=False, indent=2))
 
 

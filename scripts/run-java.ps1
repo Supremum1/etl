@@ -7,8 +7,6 @@ param(
   [int] $FetchSize = 50000,
   [int] $BatchSize = 50000,
   [int] $LimitRows = 0,
-  [ValidateSet("http-tsv", "client-v3")]
-  [string] $ClickHouseWriter = "http-tsv",
   [switch] $SkipPrepare,
   [string] $Sheet,
   [string] $Delimiter
@@ -20,15 +18,16 @@ $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 
 docker compose up -d postgres clickhouse
+if ($LASTEXITCODE -ne 0) { throw "Failed to start PostgreSQL or ClickHouse." }
 docker compose build java-cli
+if ($LASTEXITCODE -ne 0) { throw "Failed to build java-cli." }
 
 $ResolvedFile = Resolve-BenchmarkInputFile -Root $Root -File $File
 
 $ArgsList = @(
   "--dataset", $Dataset,
   "--fetch-size", "$FetchSize",
-  "--batch-size", "$BatchSize",
-  "--clickhouse-writer", $ClickHouseWriter
+  "--batch-size", "$BatchSize"
 )
 if ($ResolvedFile) { $ArgsList += @("--file", $ResolvedFile.ContainerRelative) }
 if ($LimitRows -gt 0 -and -not $SkipPrepare) { $ArgsList += @("--limit-rows", "$LimitRows") }
@@ -37,3 +36,4 @@ if ($Delimiter) { $ArgsList += @("--delimiter", $Delimiter) }
 if ($SkipPrepare) { $ArgsList += "--skip-prepare" }
 
 docker compose run --rm java-cli @ArgsList
+if ($LASTEXITCODE -ne 0) { throw "java-cli failed." }

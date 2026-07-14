@@ -18,7 +18,9 @@ $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 
 docker compose up -d postgres clickhouse
+if ($LASTEXITCODE -ne 0) { throw "Failed to start PostgreSQL or ClickHouse." }
 docker compose build python-cli
+if ($LASTEXITCODE -ne 0) { throw "Failed to build python-cli." }
 
 $ResolvedFile = Resolve-BenchmarkInputFile -Root $Root -File $File
 
@@ -35,3 +37,4 @@ if ($Sheet) { $ArgsList += @("--sheet", $Sheet) }
 if ($Delimiter) { $ArgsList += @("--delimiter", $Delimiter) }
 
 docker compose run --rm python-cli @ArgsList
+if ($LASTEXITCODE -ne 0) { throw "python-cli failed." }

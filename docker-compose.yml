@@ -4,6 +4,7 @@ services:
   postgres:
     image: postgres:16
     container_name: oltp_olap_postgres
+    command: ["postgres", "-c", "max_wal_size=4GB", "-c", "checkpoint_timeout=15min"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-etl_source}
       POSTGRES_USER: ${POSTGRES_USER:-etl}

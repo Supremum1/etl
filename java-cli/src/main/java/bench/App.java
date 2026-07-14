@@ -1,12 +1,7 @@
 package bench;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.clickhouse.client.api.Client;
-import com.clickhouse.client.api.insert.InsertResponse;
-import com.clickhouse.client.api.insert.InsertSettings;
-import com.clickhouse.data.ClickHouseFormat;
 import java.io.BufferedWriter;
-import java.io.ByteArrayInputStream;
 import java.io.FilterInputStream;
 import java.io.InputStream;
 import java.io.Reader;
@@ -33,7 +28,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
 import org.apache.commons.csv.CSVFormat;
 import org.apache.commons.csv.CSVParser;
 import org.apache.commons.csv.CSVPrinter;
@@ -83,18 +77,11 @@ public class App implements CommandLineRunner {
             env("CLICKHOUSE_USER", "default"),
             env("CLICKHOUSE_PASSWORD", "etl")
         );
-        ClickHouseClientV3 chClient = "client-v3".equals(args.clickHouseWriter)
-            ? new ClickHouseClientV3(
-                env("CLICKHOUSE_HOST", "localhost"),
-                Integer.parseInt(env("CLICKHOUSE_PORT", "8123")),
-                env("CLICKHOUSE_DATABASE", "olap_benchmark"),
-                env("CLICKHOUSE_USER", "default"),
-                env("CLICKHOUSE_PASSWORD", "etl"))
-            : null;
 
         long started = System.nanoTime();
-        long cpuStarted = currentThreadCpuMs();
+        long cpuStarted = currentProcessCpuMs();
         Metrics metrics = new Metrics();
+        metrics.benchmarkMode = args.skipPrepare ? "transfer" : "full";
         metrics.implementation = "java-spring-jdbc";
         metrics.dataset = dataset;
         metrics.sourceTable = "oltp_source." + sourceTable;
@@ -102,44 +89,49 @@ public class App implements CommandLineRunner {
         metrics.fetchSize = fetchSize;
         metrics.batchSize = batchSize;
 
-        try (Connection pg = DriverManager.getConnection(pgUrl, pgUser, pgPassword)) {
+        ProcessMemorySampler memorySampler = new ProcessMemorySampler();
+        try (memorySampler; Connection pg = DriverManager.getConnection(pgUrl, pgUser, pgPassword)) {
             if (!args.skipPrepare) {
                 prepareSource(pg, args, metrics);
             }
-            pg.setAutoCommit(false);
+            long targetSetupStarted = System.nanoTime();
             List<String> columns = pgColumns(pg, sourceTable);
             createTarget(ch, targetTable, columns, args.truncateTarget);
+            metrics.targetSetupMs += elapsedMs(targetSetupStarted);
 
             String sql = "SELECT " + joinQuotedPg(columns) + " FROM oltp_source."
-                + quotePg(sourceTable) + " ORDER BY etl_row_num";
-            long extractStart = System.nanoTime();
+                + quotePg(sourceTable) + " WHERE etl_row_num > ? ORDER BY etl_row_num LIMIT ?";
+            long lastId = 0;
             try (PreparedStatement select = pg.prepareStatement(
                     sql,
                     ResultSet.TYPE_FORWARD_ONLY,
                     ResultSet.CONCUR_READ_ONLY)) {
-                select.setFetchSize(fetchSize);
-                try (ResultSet rs = select.executeQuery()) {
-                    metrics.extractMs += elapsedMs(extractStart);
-                    List<List<Object>> batch = new ArrayList<>(batchSize);
-                    while (true) {
-                        long rowStart = System.nanoTime();
-                        boolean hasRow = rs.next();
-                        metrics.extractMs += elapsedMs(rowStart);
-                        if (!hasRow) {
-                            break;
-                        }
-                        List<Object> row = new ArrayList<>(columns.size());
-                        for (int i = 1; i <= columns.size(); i++) {
-                            row.add(rs.getObject(i));
-                        }
-                        batch.add(row);
-                        if (batch.size() >= batchSize) {
-                            writeBatch(ch, chClient, targetTable, columns, batch, metrics, args.clickHouseWriter);
-                            batch.clear();
+                while (true) {
+                    select.setLong(1, lastId);
+                    select.setInt(2, fetchSize);
+                    long fetchStart = System.nanoTime();
+                    List<List<Object>> page = new ArrayList<>(fetchSize);
+                    try (ResultSet rs = select.executeQuery()) {
+                        while (rs.next()) {
+                            List<Object> row = new ArrayList<>(columns.size());
+                            for (int i = 1; i <= columns.size(); i++) {
+                                row.add(rs.getObject(i));
+                            }
+                            page.add(row);
                         }
                     }
-                    if (!batch.isEmpty()) {
-                        writeBatch(ch, chClient, targetTable, columns, batch, metrics, args.clickHouseWriter);
+                    metrics.extractMs += elapsedMs(fetchStart);
+                    if (page.isEmpty()) {
+                        break;
+                    }
+                    lastId = ((Number) page.get(page.size() - 1).get(0)).longValue();
+                    for (int offset = 0; offset < page.size(); offset += batchSize) {
+                        int end = Math.min(offset + batchSize, page.size());
+                        List<List<Object>> batch = new ArrayList<>(end - offset);
+                        for (int i = offset; i < end; i++) {
+                            batch.add(page.get(i));
+                        }
+                        writeBatch(ch, targetTable, columns, batch, metrics);
                     }
                 }
             }
@@ -153,16 +145,15 @@ public class App implements CommandLineRunner {
             metrics.extra.put("columns", columns);
             metrics.extra.put("column_count", columns.size());
             metrics.extra.put("target_count", targetCount);
-            metrics.extra.put("notes", "Spring Boot CLI with PostgreSQL streaming ResultSet and ClickHouse writer " + args.clickHouseWriter);
-            metrics.extra.put("clickhouse_writer", args.clickHouseWriter);
-        }
-        if (chClient != null) {
-            chClient.close();
+            metrics.extra.put("notes", "Simple pipeline: file -> PostgreSQL COPY -> keyset pages -> ClickHouse HTTP TSV");
         }
 
         metrics.totalMs = elapsedMs(started);
-        metrics.cpuMs = currentThreadCpuMs() - cpuStarted;
-        metrics.peakRssMb = usedHeapMb();
+        metrics.cpuMs = currentProcessCpuMs() - cpuStarted;
+        metrics.peakRssMb = memorySampler.peakRssMb();
+        double measuredMs = metrics.prepareMs + metrics.sourceVerifyMs + metrics.targetSetupMs
+            + metrics.extractMs + metrics.serializeMs + metrics.loadMs + metrics.verifyMs;
+        metrics.overheadMs = Math.max(0, metrics.totalMs - measuredMs);
         metrics.finishRates();
         insertMetrics(ch, metrics);
         return metrics;
@@ -195,35 +186,40 @@ public class App implements CommandLineRunner {
                 + " (" + joinQuotedPg(columns) + ") FROM STDIN WITH (FORMAT csv, HEADER true"
                 + copyDelimiterOption(args) + ")";
             try (InputStream in = new NulStrippingInputStream(Files.newInputStream(input))) {
-                preparedRows = copy.copyIn(copySql, in);
+                copy.copyIn(copySql, in);
             }
             prepareMode = "csv-direct-copy";
         } else {
             Path tempCsv = Files.createTempFile("etlbench-java-" + dataset + "-", ".csv");
             try {
-            PreparedInput prepared = switch (format) {
-                case "csv" -> materializeCsv(input, tempCsv, args);
-                case "xlsx" -> materializeXlsx(input, tempCsv, args);
-                default -> throw new IllegalArgumentException("Unsupported file format: " + input);
-            };
-            columns = prepared.columns;
-            preparedRows = prepared.rows;
+                PreparedInput prepared = switch (format) {
+                    case "csv" -> materializeCsv(input, tempCsv, args);
+                    case "xlsx" -> materializeXlsx(input, tempCsv, args);
+                    default -> throw new IllegalArgumentException("Unsupported file format: " + input);
+                };
+                columns = prepared.columns;
+                createSourceTable(pg, table, columns);
 
-            createSourceTable(pg, table, columns);
-
-            CopyManager copy = new CopyManager(pg.unwrap(BaseConnection.class));
-            String copySql = "COPY oltp_source." + quotePg(table)
-                + " (" + joinQuotedPg(columns) + ") FROM STDIN WITH (FORMAT csv, HEADER true)";
-            try (InputStream in = Files.newInputStream(tempCsv)) {
-                copy.copyIn(copySql, in);
-            }
-            prepareMode = "materialized-clean-csv";
+                CopyManager copy = new CopyManager(pg.unwrap(BaseConnection.class));
+                String copySql = "COPY oltp_source." + quotePg(table)
+                    + " (" + joinQuotedPg(columns) + ") FROM STDIN WITH (FORMAT csv, HEADER true)";
+                try (InputStream in = Files.newInputStream(tempCsv)) {
+                    copy.copyIn(copySql, in);
+                }
+                prepareMode = "materialized-clean-csv";
             } finally {
-            Files.deleteIfExists(tempCsv);
+                Files.deleteIfExists(tempCsv);
             }
         }
 
         metrics.prepareMs += elapsedMs(started);
+        long verifyStarted = System.nanoTime();
+        try (Statement count = pg.createStatement(); ResultSet rs = count.executeQuery(
+                "SELECT count(*) FROM oltp_source." + quotePg(table))) {
+            rs.next();
+            preparedRows = rs.getLong(1);
+        }
+        metrics.sourceVerifyMs += elapsedMs(verifyStarted);
         metrics.extra.put("source_columns", columns);
         metrics.extra.put("prepared_rows", preparedRows);
         metrics.extra.put("limit_rows", args.limitRows == 0 ? null : args.limitRows);
@@ -385,27 +381,20 @@ public class App implements CommandLineRunner {
         }
         ch.command("CREATE TABLE IF NOT EXISTS " + quoteCh(table)
             + " (" + String.join(", ", ddl) + ") ENGINE = MergeTree ORDER BY etl_row_num");
-        if (truncate) {
-            ch.command("TRUNCATE TABLE " + quoteCh(table));
-        }
     }
 
     private static void writeBatch(
         ClickHouseHttp ch,
-        ClickHouseClientV3 chClient,
         String table,
         List<String> columns,
         List<List<Object>> rows,
-        Metrics metrics,
-        String writer
+        Metrics metrics
     )
         throws Exception {
-        long loadStart = System.nanoTime();
+        long serializeStart = System.nanoTime();
         StringBuilder body = new StringBuilder();
-        if ("http-tsv".equals(writer)) {
-            body.append("INSERT INTO ").append(quoteCh(table)).append(" (")
-                .append(joinQuotedCh(columns)).append(") FORMAT TabSeparated\n");
-        }
+        body.append("INSERT INTO ").append(quoteCh(table)).append(" (")
+            .append(joinQuotedCh(columns)).append(") FORMAT TabSeparated\n");
         for (List<Object> row : rows) {
             for (int i = 0; i < row.size(); i++) {
                 if (i > 0) {
@@ -419,11 +408,11 @@ public class App implements CommandLineRunner {
             }
             body.append('\n');
         }
-        if ("client-v3".equals(writer)) {
-            chClient.insert(table, body.toString());
-        } else {
-            ch.command(body.toString());
-        }
+        byte[] payload = body.toString().getBytes(StandardCharsets.UTF_8);
+        metrics.serializeMs += elapsedMs(serializeStart);
+
+        long loadStart = System.nanoTime();
+        ch.command(payload);
         metrics.loadMs += elapsedMs(loadStart);
         metrics.rows += rows.size();
         metrics.batchCount += 1;
@@ -432,14 +421,17 @@ public class App implements CommandLineRunner {
     private static void insertMetrics(ClickHouseHttp ch, Metrics m) throws Exception {
         createMetricsTable(ch);
         List<String> columns = List.of(
-            "run_id", "implementation", "dataset", "source_table", "target_table", "input_file", "file_format",
-            "rows", "logical_bytes", "fetch_size", "batch_size", "batch_count", "prepare_ms", "extract_ms",
-            "load_ms", "verify_ms", "total_ms", "rows_per_sec", "mb_per_sec", "peak_rss_mb", "cpu_ms", "extra_json"
+            "benchmark_version", "benchmark_mode", "run_id", "implementation", "dataset", "source_table", "target_table", "input_file", "file_format",
+            "rows", "logical_bytes", "fetch_size", "batch_size", "batch_count", "prepare_ms",
+            "source_verify_ms", "target_setup_ms", "extract_ms", "serialize_ms", "load_ms", "verify_ms",
+            "overhead_ms", "total_ms", "rows_per_sec", "mb_per_sec", "peak_rss_mb", "cpu_ms", "extra_json"
         );
         List<Object> values = List.of(
-            m.runId, m.implementation, m.dataset, m.sourceTable, m.targetTable, m.inputFile, m.fileFormat,
-            m.rows, m.logicalBytes, m.fetchSize, m.batchSize, m.batchCount, m.prepareMs, m.extractMs,
-            m.loadMs, m.verifyMs, m.totalMs, m.rowsPerSec, m.mbPerSec, m.peakRssMb, m.cpuMs, JSON.writeValueAsString(m.extra)
+            m.benchmarkVersion, m.benchmarkMode, m.runId, m.implementation, m.dataset, m.sourceTable, m.targetTable, m.inputFile, m.fileFormat,
+            m.rows, m.logicalBytes, m.fetchSize, m.batchSize, m.batchCount, m.prepareMs,
+            m.sourceVerifyMs, m.targetSetupMs, m.extractMs, m.serializeMs, m.loadMs, m.verifyMs,
+            m.overheadMs, m.totalMs, m.rowsPerSec, m.mbPerSec, m.peakRssMb, m.cpuMs,
+            JSON.writeValueAsString(m.extra)
         );
         StringBuilder body = new StringBuilder();
         body.append("INSERT INTO benchmark_runs (").append(joinQuotedCh(columns)).append(") FORMAT TabSeparated\n");
@@ -457,6 +449,8 @@ public class App implements CommandLineRunner {
         ch.command("""
             CREATE TABLE IF NOT EXISTS benchmark_runs
             (
+                benchmark_version UInt16 DEFAULT 2,
+                benchmark_mode LowCardinality(String),
                 run_id UUID,
                 measured_at DateTime64(3, 'UTC') DEFAULT now64(3),
                 implementation LowCardinality(String),
@@ -471,9 +465,13 @@ public class App implements CommandLineRunner {
                 batch_size UInt32,
                 batch_count UInt64,
                 prepare_ms Float64,
+                source_verify_ms Float64,
+                target_setup_ms Float64,
                 extract_ms Float64,
+                serialize_ms Float64,
                 load_ms Float64,
                 verify_ms Float64,
+                overhead_ms Float64,
                 total_ms Float64,
                 rows_per_sec Float64,
                 mb_per_sec Float64,
@@ -484,6 +482,11 @@ public class App implements CommandLineRunner {
             ENGINE = MergeTree
             ORDER BY (dataset, implementation, measured_at, run_id)
             """);
+        ch.command("ALTER TABLE benchmark_runs ADD COLUMN IF NOT EXISTS benchmark_version UInt16 DEFAULT 1");
+        ch.command("ALTER TABLE benchmark_runs ADD COLUMN IF NOT EXISTS benchmark_mode LowCardinality(String) DEFAULT 'legacy'");
+        for (String column : List.of("source_verify_ms", "target_setup_ms", "serialize_ms", "overhead_ms")) {
+            ch.command("ALTER TABLE benchmark_runs ADD COLUMN IF NOT EXISTS " + column + " Float64 DEFAULT 0");
+        }
     }
 
     private static String env(String name, String fallback) {
@@ -578,14 +581,59 @@ public class App implements CommandLineRunner {
         return (System.nanoTime() - startedNanos) / 1_000_000.0;
     }
 
-    private static long currentThreadCpuMs() {
-        var bean = ManagementFactory.getThreadMXBean();
-        return bean.isCurrentThreadCpuTimeSupported() ? bean.getCurrentThreadCpuTime() / 1_000_000 : 0;
+    private static long currentProcessCpuMs() {
+        var bean = ManagementFactory.getPlatformMXBean(com.sun.management.OperatingSystemMXBean.class);
+        long nanos = bean == null ? -1 : bean.getProcessCpuTime();
+        return nanos >= 0 ? nanos / 1_000_000 : 0;
     }
 
-    private static double usedHeapMb() {
+    private static double currentProcessRssMb() {
+        try {
+            for (String line : Files.readAllLines(Path.of("/proc/self/status"))) {
+                if (line.startsWith("VmRSS:")) {
+                    String kb = line.replaceAll("[^0-9]", "");
+                    return Long.parseLong(kb) / 1024.0;
+                }
+            }
+        } catch (Exception ignored) {
+            // Docker runs Linux; this fallback keeps local development usable.
+        }
         Runtime runtime = Runtime.getRuntime();
         return (runtime.totalMemory() - runtime.freeMemory()) / 1024.0 / 1024.0;
+    }
+
+    static final class ProcessMemorySampler implements AutoCloseable {
+        private final Thread thread;
+        private volatile boolean running = true;
+        private volatile double peakRssMb = currentProcessRssMb();
+
+        ProcessMemorySampler() {
+            thread = new Thread(() -> {
+                while (running) {
+                    peakRssMb = Math.max(peakRssMb, currentProcessRssMb());
+                    try {
+                        Thread.sleep(50);
+                    } catch (InterruptedException ignored) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
+            }, "memory-sampler");
+            thread.setDaemon(true);
+            thread.start();
+        }
+
+        double peakRssMb() {
+            return Math.max(peakRssMb, currentProcessRssMb());
+        }
+
+        @Override
+        public void close() throws InterruptedException {
+            running = false;
+            thread.interrupt();
+            thread.join(1000);
+            peakRssMb = Math.max(peakRssMb, currentProcessRssMb());
+        }
     }
 
     static final class Args {
@@ -593,7 +641,6 @@ public class App implements CommandLineRunner {
         String file;
         String sheet;
         String delimiter;
-        String clickHouseWriter = "http-tsv";
         int fetchSize = 50_000;
         int batchSize = 50_000;
         int limitRows;
@@ -608,7 +655,6 @@ public class App implements CommandLineRunner {
                     case "--file" -> args.file = raw[++i];
                     case "--sheet" -> args.sheet = raw[++i];
                     case "--delimiter" -> args.delimiter = raw[++i];
-                    case "--clickhouse-writer" -> args.clickHouseWriter = raw[++i];
                     case "--fetch-size" -> args.fetchSize = Integer.parseInt(raw[++i]);
                     case "--batch-size" -> args.batchSize = Integer.parseInt(raw[++i]);
                     case "--limit-rows" -> args.limitRows = Integer.parseInt(raw[++i]);
@@ -619,9 +665,6 @@ public class App implements CommandLineRunner {
             }
             if (args.dataset == null || args.dataset.isBlank()) {
                 throw new IllegalArgumentException("--dataset is required");
-            }
-            if (!List.of("http-tsv", "client-v3").contains(args.clickHouseWriter)) {
-                throw new IllegalArgumentException("--clickhouse-writer must be http-tsv or client-v3");
             }
             return args;
         }
@@ -671,6 +714,8 @@ public class App implements CommandLineRunner {
     }
 
     static final class Metrics {
+        int benchmarkVersion = 2;
+        String benchmarkMode = "full";
         String runId = UUID.randomUUID().toString();
         String implementation;
         String dataset;
@@ -684,9 +729,13 @@ public class App implements CommandLineRunner {
         int batchSize;
         long batchCount;
         double prepareMs;
+        double sourceVerifyMs;
+        double targetSetupMs;
         double extractMs;
+        double serializeMs;
         double loadMs;
         double verifyMs;
+        double overheadMs;
         double totalMs;
         double rowsPerSec;
         double mbPerSec;
@@ -702,6 +751,8 @@ public class App implements CommandLineRunner {
 
         Map<String, Object> toMap() {
             Map<String, Object> data = new LinkedHashMap<>();
+            data.put("benchmark_version", benchmarkVersion);
+            data.put("benchmark_mode", benchmarkMode);
             data.put("run_id", runId);
             data.put("measured_at", Instant.now().toString());
             data.put("implementation", implementation);
@@ -716,9 +767,13 @@ public class App implements CommandLineRunner {
             data.put("batch_size", batchSize);
             data.put("batch_count", batchCount);
             data.put("prepare_ms", prepareMs);
+            data.put("source_verify_ms", sourceVerifyMs);
+            data.put("target_setup_ms", targetSetupMs);
             data.put("extract_ms", extractMs);
+            data.put("serialize_ms", serializeMs);
             data.put("load_ms", loadMs);
             data.put("verify_ms", verifyMs);
+            data.put("overhead_ms", overheadMs);
             data.put("total_ms", totalMs);
             data.put("rows_per_sec", rowsPerSec);
             data.put("mb_per_sec", mbPerSec);
@@ -744,9 +799,13 @@ public class App implements CommandLineRunner {
         }
 
         void command(String sql) throws Exception {
+            command(sql.getBytes(StandardCharsets.UTF_8));
+        }
+
+        void command(byte[] payload) throws Exception {
             HttpRequest request = HttpRequest.newBuilder(URI.create(endpoint))
                 .header("Authorization", authHeader)
-                .POST(HttpRequest.BodyPublishers.ofString(sql, StandardCharsets.UTF_8))
+                .POST(HttpRequest.BodyPublishers.ofByteArray(payload))
                 .build();
             HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
             if (response.statusCode() >= 300) {
@@ -767,31 +826,4 @@ public class App implements CommandLineRunner {
         }
     }
 
-    static final class ClickHouseClientV3 implements AutoCloseable {
-        private final Client client;
-        private final InsertSettings insertSettings = new InsertSettings().setInputStreamCopyBufferSize(1024 * 1024);
-
-        ClickHouseClientV3(String host, int port, String database, String user, String password) {
-            this.client = new Client.Builder()
-                .addEndpoint("http://" + host + ":" + port + "/")
-                .setDefaultDatabase(database)
-                .setUsername(user)
-                .setPassword(password)
-                .build();
-        }
-
-        void insert(String table, String tsvBody) throws Exception {
-            try (
-                ByteArrayInputStream input = new ByteArrayInputStream(tsvBody.getBytes(StandardCharsets.UTF_8));
-                InsertResponse response = client.insert(table, input, ClickHouseFormat.TSV, insertSettings).get(5, TimeUnit.MINUTES)
-            ) {
-                // Closing the response releases the client connection.
-            }
-        }
-
-        @Override
-        public void close() {
-            client.close();
-        }
-    }
 }

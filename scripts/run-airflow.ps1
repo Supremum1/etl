@@ -18,6 +18,7 @@ $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 
 docker compose up -d --build postgres clickhouse airflow
+if ($LASTEXITCODE -ne 0) { throw "Failed to start benchmark services." }
 
 $Conf = @{
   dataset = $Dataset
@@ -82,7 +83,7 @@ do {
   $ImportErrorsResult = Invoke-DockerCapture -Arguments @("compose", "exec", "-T", "airflow", "airflow", "dags", "list-import-errors")
   $ImportErrors = $ImportErrorsResult.Output
   if ($ImportErrorsResult.ExitCode -ne 0) {
-    if ($ImportErrors -match "initialize the database|metadata database" -and (Get-Date) -lt $Deadline) {
+    if ($ImportErrors -match "initialize the database|metadata database|database is locked" -and (Get-Date) -lt $Deadline) {
       Start-Sleep -Seconds 5
       continue
     }
@@ -97,6 +98,10 @@ do {
   $DagListResult = Invoke-DockerCapture -Arguments @("compose", "exec", "-T", "airflow", "airflow", "dags", "list")
   $DagList = $DagListResult.Output
   if ($DagListResult.ExitCode -ne 0) {
+    if ($DagList -match "database is locked" -and (Get-Date) -lt $Deadline) {
+      Start-Sleep -Seconds 5
+      continue
+    }
     Write-Host $DagList
     throw "Failed to inspect Airflow DAG list."
   }
@@ -116,33 +121,82 @@ if (-not (Test-Path -LiteralPath (Join-Path $Root "work"))) {
 }
 $ConfPath = Join-Path $Root "work\airflow_conf.json"
 $TriggerPath = Join-Path $Root "work\airflow_trigger.py"
+$StatePath = Join-Path $Root "work\airflow_state.py"
+$RunIdPath = Join-Path $Root "work\airflow_run_id.txt"
+$RunId = "benchmark_{0}" -f ([guid]::NewGuid().ToString("N"))
 Set-Content -LiteralPath $ConfPath -Value $Json -NoNewline -Encoding ascii
+Set-Content -LiteralPath $RunIdPath -Value $RunId -NoNewline -Encoding ascii
 Set-Content -LiteralPath $TriggerPath -Encoding ascii -Value @'
 import subprocess
 from pathlib import Path
 
 conf = Path("/benchmark/work/airflow_conf.json").read_text(encoding="ascii")
+run_id = Path("/benchmark/work/airflow_run_id.txt").read_text(encoding="ascii")
 raise SystemExit(subprocess.call([
     "airflow",
     "dags",
     "trigger",
     "oltp_olap_benchmark",
+    "--run-id",
+    run_id,
     "--conf",
     conf,
 ]))
+'@
+Set-Content -LiteralPath $StatePath -Encoding ascii -Value @'
+from pathlib import Path
+
+from airflow.models.dagrun import DagRun
+from airflow.utils.session import create_session
+
+run_id = Path("/benchmark/work/airflow_run_id.txt").read_text(encoding="ascii")
+with create_session() as session:
+    dag_run = session.query(DagRun).filter(
+        DagRun.dag_id == "oltp_olap_benchmark",
+        DagRun.run_id == run_id,
+    ).one_or_none()
+print(dag_run.state if dag_run else "missing")
 '@
 
 $TriggerDeadline = (Get-Date).AddMinutes(2)
 do {
   $TriggerResult = Invoke-DockerCapture -Arguments @("compose", "exec", "-T", "airflow", "python", "/benchmark/work/airflow_trigger.py")
   if ($TriggerResult.ExitCode -eq 0) {
-    Write-Host "Airflow DAG oltp_olap_benchmark triggered for dataset '$Dataset'."
+    Write-Host "Airflow DAG started for dataset '$Dataset' (run_id=$RunId)."
     break
   }
-  if ($TriggerResult.Output -match "DagNotFound" -and (Get-Date) -lt $TriggerDeadline) {
+  if ($TriggerResult.Output -match "DagNotFound|database is locked" -and (Get-Date) -lt $TriggerDeadline) {
     Start-Sleep -Seconds 5
     continue
   }
   Write-Host $TriggerResult.Output
   throw "Failed to trigger Airflow DAG."
+} while ($true)
+
+$RunDeadline = (Get-Date).AddHours(6)
+do {
+  $StateResult = Invoke-DockerCapture -Arguments @(
+    "compose", "exec", "-T", "airflow", "python", "/benchmark/work/airflow_state.py"
+  )
+  if ($StateResult.ExitCode -ne 0) {
+    if ($StateResult.Output -match "database is locked" -and (Get-Date) -lt $RunDeadline) {
+      Start-Sleep -Seconds 5
+      continue
+    }
+    Write-Host $StateResult.Output
+    throw "Failed to read Airflow DAG state."
+  }
+
+  $State = ($StateResult.Output -split "`r?`n" | Select-Object -Last 1).Trim().ToLowerInvariant()
+  if ($State -eq "success") {
+    Write-Host "Airflow DAG completed successfully."
+    break
+  }
+  if ($State -in @("failed", "upstream_failed")) {
+    throw "Airflow DAG failed (run_id=$RunId). Check http://localhost:8080."
+  }
+  if ((Get-Date) -ge $RunDeadline) {
+    throw "Airflow DAG did not finish within 6 hours (run_id=$RunId, state=$State)."
+  }
+  Start-Sleep -Seconds 5
 } while ($true)
