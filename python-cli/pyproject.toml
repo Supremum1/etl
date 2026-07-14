@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "etlbench"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+  "clickhouse-connect==0.7.19",
+  "openpyxl==3.1.5",
+  "psutil==6.1.0",
+  "psycopg[binary]==3.2.3"
+]
+
+[tool.setuptools.packages.find]
+include = ["etlbench*"]

@@ -1,0 +1,136 @@
+name: oltp-olap-benchmark
+
+services:
+  postgres:
+    image: postgres:16
+    container_name: oltp_olap_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-etl_source}
+      POSTGRES_USER: ${POSTGRES_USER:-etl}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-etl}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/postgres:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: oltp_olap_clickhouse
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DATABASE:-olap_benchmark}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-etl}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "${CLICKHOUSE_HTTP_PORT:-8123}:8123"
+      - "${CLICKHOUSE_NATIVE_PORT:-9000}:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./sql/clickhouse:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  python-cli:
+    build:
+      context: .
+      dockerfile: python-cli/Dockerfile
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-etl_source}
+      POSTGRES_USER: ${POSTGRES_USER:-etl}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-etl}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-olap_benchmark}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-etl}
+    volumes:
+      - ./data:/benchmark/data
+      - ./work:/benchmark/work
+
+  java-cli:
+    build:
+      context: .
+      dockerfile: java-cli/Dockerfile
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-etl_source}
+      POSTGRES_USER: ${POSTGRES_USER:-etl}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-etl}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-olap_benchmark}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-etl}
+    volumes:
+      - ./data:/benchmark/data
+      - ./work:/benchmark/work
+
+  airflow:
+    build:
+      context: .
+      dockerfile: airflow/Dockerfile
+    container_name: oltp_olap_airflow
+    depends_on:
+      postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    ports:
+      - "${AIRFLOW_PORT:-8080}:8080"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+      AIRFLOW_ADMIN_USER: ${AIRFLOW_ADMIN_USER:-admin}
+      AIRFLOW_ADMIN_PASSWORD: ${AIRFLOW_ADMIN_PASSWORD:-admin}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB:-etl_source}
+      POSTGRES_USER: ${POSTGRES_USER:-etl}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-etl}
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_DATABASE: ${CLICKHOUSE_DATABASE:-olap_benchmark}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-etl}
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./data:/benchmark/data
+      - ./work:/benchmark/work
+    command: >
+      bash -lc "
+        set -e;
+        airflow db migrate;
+        airflow users create --username admin --password admin --firstname ETL --lastname Benchmark --role Admin --email admin@example.com || true;
+        airflow scheduler &
+        exec airflow webserver
+      "
+
+volumes:
+  postgres_data:
+  clickhouse_data:

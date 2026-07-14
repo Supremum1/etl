@@ -1,0 +1,4 @@
+clickhouse-connect==0.7.19
+openpyxl==3.1.5
+psutil==6.1.0
+psycopg[binary]==3.2.3

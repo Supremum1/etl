@@ -1,0 +1,6 @@
+.env
+work/
+data/input/
+airflow/logs/
+*.class
+target/
