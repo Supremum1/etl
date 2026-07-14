@@ -1,0 +1,92 @@
+@startuml
+title Python CLI: CSV -> PostgreSQL -> ClickHouse
+
+actor User
+participant "Python CLI\netlbench.__main__" as CLI
+participant "source_loader" as Loader
+participant "psycopg" as PgClient
+database PostgreSQL as PG
+participant "transfer" as Transfer
+participant "clickhouse-driver\nClient" as ChClient
+database ClickHouse as CH
+participant "metrics" as Metrics
+
+User -> CLI: run --dataset --file\n--fetch-size --batch-size
+activate CLI
+
+CLI -> Loader: prepare_postgres_source(...)
+activate Loader
+Loader -> Loader: Read CSV header\nNormalize column names
+Loader -> PgClient: connect(host, port 5432)
+activate PgClient
+PgClient -> PG: PostgreSQL wire protocol over TCP
+Loader -> PG: CREATE SCHEMA / DROP TABLE / CREATE TABLE
+Loader -> PG: COPY FROM STDIN
+note right of Loader
+  CSV is read in byte chunks.
+  The whole file is not loaded into RAM.
+end note
+PG --> Loader: COPY completed
+Loader -> PG: SELECT count(*)
+PG --> Loader: prepared row count
+Loader -> PgClient: close()
+deactivate PgClient
+Loader --> CLI: format and row count
+deactivate Loader
+
+CLI -> Transfer: transfer_postgres_to_clickhouse(...)
+activate Transfer
+Transfer -> ChClient: Client(host, port 9000, compression=LZ4)
+activate ChClient
+ChClient -> CH: Native Protocol handshake over TCP
+
+Transfer -> PgClient: connect(host, port 5432)
+activate PgClient
+PgClient -> PG: PostgreSQL wire protocol over TCP
+Transfer -> PG: Read source column metadata
+PG --> Transfer: ordered column names
+Transfer -> ChClient: execute(DROP/CREATE target)
+ChClient -> CH: Native Protocol query
+CH --> ChClient: target ready
+
+Transfer -> PgClient: Open named server-side cursor
+PgClient -> PG: SELECT columns ORDER BY etl_row_num
+
+loop Until PostgreSQL cursor is exhausted
+  Transfer -> PgClient: fetchmany(fetch_size)
+  PgClient -> PG: Fetch next rows
+  PG --> PgClient: page of at most fetch_size rows
+  PgClient --> Transfer: rows
+
+  loop Each batch_size slice of the page
+    Transfer -> ChClient: execute(INSERT ... VALUES, batch)
+    ChClient -> ChClient: Encode binary columnar block\nand compress with LZ4
+    ChClient -> CH: Native Protocol INSERT over TCP 9000
+    CH --> ChClient: insert completed
+    ChClient --> Transfer: inserted row count
+  end
+end
+
+Transfer -> PgClient: close cursor and connection
+deactivate PgClient
+Transfer -> ChClient: execute(SELECT count())
+ChClient -> CH: Native Protocol query
+CH --> ChClient: target row count
+Transfer -> Transfer: Compare source transfer count\nwith target count
+
+Transfer -> Metrics: insert_metrics(metrics, client)
+activate Metrics
+Metrics -> ChClient: execute(INSERT benchmark_runs)
+ChClient -> CH: Native Protocol INSERT
+CH --> ChClient: metrics saved
+Metrics --> Transfer
+deactivate Metrics
+
+Transfer -> ChClient: disconnect()
+deactivate ChClient
+Transfer --> CLI: BenchmarkMetrics
+deactivate Transfer
+CLI --> User: JSON result
+deactivate CLI
+
+@enduml

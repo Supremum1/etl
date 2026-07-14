@@ -20,7 +20,7 @@ SELECT
     round(avg(peak_rss_mb), 2) AS avg_peak_rss_mb,
     round(avg(cpu_ms), 2) AS avg_cpu_ms
 FROM olap_benchmark.benchmark_runs
-WHERE benchmark_version = 2 AND benchmark_mode IN ('full', 'transfer')
+WHERE benchmark_version = 4 AND benchmark_mode IN ('full', 'transfer')
 GROUP BY
     dataset,
     benchmark_mode,

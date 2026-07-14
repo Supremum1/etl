@@ -2,7 +2,7 @@ CREATE DATABASE IF NOT EXISTS olap_benchmark;
 
 CREATE TABLE IF NOT EXISTS olap_benchmark.benchmark_runs
 (
-    benchmark_version UInt16 DEFAULT 2,
+    benchmark_version UInt16 DEFAULT 4,
     benchmark_mode LowCardinality(String),
     run_id UUID,
     measured_at DateTime64(3, 'UTC') DEFAULT now64(3),

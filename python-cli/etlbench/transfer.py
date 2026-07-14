@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import json
-import base64
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
-from urllib import request
-from urllib.parse import urlencode
 
 import psycopg
+from clickhouse_driver import Client
 
 from etlbench.config import ClickHouseConfig, PostgresConfig
 from etlbench.identifiers import quote_ch_ident, quote_pg_ident, require_dataset
@@ -22,65 +20,51 @@ from etlbench.metrics import (
 from etlbench.source_loader import source_table_name
 
 
-class ClickHouseHttp:
-    def __init__(self, config: ClickHouseConfig) -> None:
-        self.database = config.database
-        self.url = f"http://{config.host}:{config.port}/?" + urlencode({"database": config.database})
-        token = base64.b64encode(f"{config.user}:{config.password}".encode("utf-8")).decode("ascii")
-        self.authorization = f"Basic {token}"
+def _new_clickhouse_client(config: ClickHouseConfig) -> Client:
+    return Client(
+        host=config.host,
+        port=config.port,
+        user=config.user,
+        password=config.password,
+        database=config.database,
+        compression=True,
+    )
 
-    def command(self, sql: str | bytes) -> str:
-        data = sql if isinstance(sql, bytes) else sql.encode("utf-8")
-        req = request.Request(
-            self.url,
-            data=data,
-            headers={"Authorization": self.authorization},
-            method="POST",
+
+def _pg_columns(conn: psycopg.Connection, table: str) -> list[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_schema = 'oltp_source'
+              AND table_name = %s
+              AND column_name <> 'loaded_at'
+            ORDER BY ordinal_position
+            """,
+            (table,),
         )
-        with request.urlopen(req) as response:
-            return response.read().decode("utf-8").strip()
-
-    def query_int(self, sql: str) -> int:
-        return int(self.command(sql))
-
-
-def _pg_columns(pg_config: PostgresConfig, table: str) -> list[str]:
-    with psycopg.connect(pg_config.dsn) as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_schema = 'oltp_source'
-                  AND table_name = %s
-                  AND column_name <> 'loaded_at'
-                ORDER BY ordinal_position
-                """,
-                (table,),
-            )
-            columns = [row[0] for row in cur.fetchall()]
+        columns = [row[0] for row in cur]
     if not columns:
         raise RuntimeError(f"Postgres source table oltp_source.{table} has no columns")
     return columns
 
 
 def _create_clickhouse_target(
-    ch_config: ClickHouseConfig,
+    client: Client,
     target_table: str,
     columns: list[str],
     truncate: bool,
-):
-    client = ClickHouseHttp(ch_config)
-    client.command(f"CREATE DATABASE IF NOT EXISTS {quote_ch_ident(ch_config.database)}")
+) -> None:
     if truncate:
-        client.command(f"DROP TABLE IF EXISTS {quote_ch_ident(target_table)}")
-    column_ddl = []
-    for column in columns:
-        if column == "etl_row_num":
-            column_ddl.append(f"{quote_ch_ident(column)} UInt64")
-        else:
-            column_ddl.append(f"{quote_ch_ident(column)} Nullable(String)")
-    client.command(
+        client.execute(f"DROP TABLE IF EXISTS {quote_ch_ident(target_table)}")
+    column_ddl = [
+        f"{quote_ch_ident(column)} UInt64"
+        if column == "etl_row_num"
+        else f"{quote_ch_ident(column)} Nullable(String)"
+        for column in columns
+    ]
+    client.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {quote_ch_ident(target_table)}
         (
@@ -90,48 +74,24 @@ def _create_clickhouse_target(
         ORDER BY etl_row_num
         """
     )
-    return client
-
-
-def _to_tab_separated(value: Any) -> str:
-    if value is None:
-        return r"\N"
-    return (
-        str(value)
-        .replace("\\", "\\\\")
-        .replace("\t", r"\t")
-        .replace("\n", r"\n")
-        .replace("\r", r"\r")
-    )
 
 
 def _write_batch(
-    client: ClickHouseHttp,
+    client: Client,
     target_table: str,
     columns: list[str],
     batch: list[tuple[Any, ...]],
     metrics: BenchmarkMetrics,
 ) -> None:
-    serialize_started = now_ms()
-    lines = [
-        f"INSERT INTO {quote_ch_ident(target_table)} "
-        f"({', '.join(quote_ch_ident(column) for column in columns)}) FORMAT TabSeparated"
-    ]
-    logical_bytes = 0
-    for row in batch:
-        lines.append("\t".join(_to_tab_separated(value) for value in row))
-        for value in row:
-            if value is not None:
-                logical_bytes += len(str(value).encode("utf-8"))
-    body = ("\n".join(lines) + "\n").encode("utf-8")
-    metrics.serialize_ms += now_ms() - serialize_started
-
     load_started = now_ms()
-    client.command(body)
+    insert_sql = (
+        f"INSERT INTO {quote_ch_ident(target_table)} "
+        f"({', '.join(quote_ch_ident(column) for column in columns)}) VALUES"
+    )
+    client.execute(insert_sql, batch)
     metrics.load_ms += now_ms() - load_started
     metrics.rows += len(batch)
     metrics.batch_count += 1
-    metrics.logical_bytes += logical_bytes
 
 
 def transfer_postgres_to_clickhouse(
@@ -169,68 +129,86 @@ def transfer_postgres_to_clickhouse(
 
     wall_started = total_started if total_started is not None else now_ms()
     process_cpu_started = cpu_started if cpu_started is not None else process_cpu_ms()
-
-    target_setup_started = now_ms()
-    columns = _pg_columns(pg_config, source_table)
-    client = _create_clickhouse_target(ch_config, target_table, columns, truncate_target)
-    metrics.target_setup_ms += now_ms() - target_setup_started
-    select_sql = (
-        f"SELECT {', '.join(quote_pg_ident(column) for column in columns)} "
-        f"FROM oltp_source.{quote_pg_ident(source_table)} "
-        f"WHERE etl_row_num > %s ORDER BY etl_row_num LIMIT %s"
-    )
     monitor = MemorySampler() if memory_sampler is None else nullcontext(memory_sampler)
-    with monitor as sampler:
-        with psycopg.connect(pg_config.dsn, autocommit=True) as conn:
-            last_id = 0
-            with conn.cursor() as cur:
-                while True:
-                    fetch_started = now_ms()
-                    cur.execute(select_sql, (last_id, fetch_size))
-                    rows = cur.fetchall()
-                    metrics.extract_ms += now_ms() - fetch_started
-                    if not rows:
-                        break
-                    last_id = int(rows[-1][0])
-                    for offset in range(0, len(rows), batch_size):
-                        batch = rows[offset : offset + batch_size]
-                        _write_batch(client, target_table, columns, batch, metrics)
+    client = _new_clickhouse_client(ch_config)
 
-        verify_started = now_ms()
-        target_count = client.query_int(f"SELECT count() FROM {quote_ch_ident(target_table)}")
-        metrics.verify_ms += now_ms() - verify_started
-        if int(target_count) != metrics.rows:
-            raise RuntimeError(
-                f"Target row count mismatch for {target_table}: expected {metrics.rows}, got {target_count}"
+    try:
+        with monitor as sampler:
+            with psycopg.connect(pg_config.dsn) as conn:
+                target_setup_started = now_ms()
+                columns = _pg_columns(conn, source_table)
+                _create_clickhouse_target(client, target_table, columns, truncate_target)
+                metrics.target_setup_ms += now_ms() - target_setup_started
+
+                select_sql = (
+                    f"SELECT {', '.join(quote_pg_ident(column) for column in columns)} "
+                    f"FROM oltp_source.{quote_pg_ident(source_table)} ORDER BY etl_row_num"
+                )
+                with conn.cursor(name="oltp_olap_transfer") as cur:
+                    cur.execute(select_sql)
+                    while True:
+                        extract_started = now_ms()
+                        rows = cur.fetchmany(fetch_size)
+                        metrics.extract_ms += now_ms() - extract_started
+                        if not rows:
+                            break
+
+                        metrics.logical_bytes += sum(
+                            len(str(value).encode("utf-8"))
+                            for row in rows
+                            for value in row
+                            if value is not None
+                        )
+                        for offset in range(0, len(rows), batch_size):
+                            _write_batch(
+                                client,
+                                target_table,
+                                columns,
+                                rows[offset : offset + batch_size],
+                                metrics,
+                            )
+
+            verify_started = now_ms()
+            target_count = int(
+                client.execute(f"SELECT count() FROM {quote_ch_ident(target_table)}")[0][0]
             )
+            metrics.verify_ms += now_ms() - verify_started
+            if target_count != metrics.rows:
+                raise RuntimeError(
+                    f"Target row count mismatch for {target_table}: "
+                    f"expected {metrics.rows}, got {target_count}"
+                )
+            metrics.peak_rss_mb = sampler.peak_rss / 1024 / 1024
 
-        metrics.peak_rss_mb = sampler.peak_rss / 1024 / 1024
-
-    metrics.total_ms = now_ms() - wall_started
-    if total_started is None:
-        metrics.total_ms += metrics.prepare_ms + metrics.source_verify_ms
-    metrics.cpu_ms += process_cpu_ms() - process_cpu_started
-    measured_ms = (
-        metrics.prepare_ms
-        + metrics.source_verify_ms
-        + metrics.target_setup_ms
-        + metrics.extract_ms
-        + metrics.serialize_ms
-        + metrics.load_ms
-        + metrics.verify_ms
-    )
-    metrics.overhead_ms = max(0.0, metrics.total_ms - measured_ms)
-    metrics.finish_rates()
-    metrics.set_extra(
-        {
-            "columns": columns,
-            "column_count": len(columns),
-            "prepared_rows": prepared_rows,
-            "target_count": int(target_count),
-            "notes": "Simple pipeline: file -> PostgreSQL COPY -> keyset pages -> ClickHouse HTTP TSV",
-            **json.loads(metrics.extra_json or "{}"),
-        }
-    )
-    if write_metrics:
-        insert_metrics(ch_config, metrics)
-    return metrics
+        metrics.total_ms = now_ms() - wall_started
+        if total_started is None:
+            metrics.total_ms += metrics.prepare_ms + metrics.source_verify_ms
+        metrics.cpu_ms += process_cpu_ms() - process_cpu_started
+        measured_ms = (
+            metrics.prepare_ms
+            + metrics.source_verify_ms
+            + metrics.target_setup_ms
+            + metrics.extract_ms
+            + metrics.serialize_ms
+            + metrics.load_ms
+            + metrics.verify_ms
+        )
+        metrics.overhead_ms = max(0.0, metrics.total_ms - measured_ms)
+        metrics.finish_rates()
+        metrics.set_extra(
+            {
+                "columns": columns,
+                "column_count": len(columns),
+                "prepared_rows": prepared_rows,
+                "target_count": target_count,
+                "clickhouse_client": "clickhouse-driver",
+                "clickhouse_transport": "Native protocol over TCP port 9000",
+                "notes": "One PostgreSQL server cursor -> ClickHouse Native binary blocks",
+                **json.loads(metrics.extra_json or "{}"),
+            }
+        )
+        if write_metrics:
+            insert_metrics(ch_config, metrics, client=client)
+        return metrics
+    finally:
+        client.disconnect()

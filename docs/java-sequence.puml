@@ -1,0 +1,106 @@
+@startuml
+title Java CLI: CSV -> PostgreSQL -> ClickHouse
+
+actor User
+participant "Spring Boot\nApp" as App
+participant BenchmarkPipeline as Pipeline
+participant PostgresClient as PgClient
+participant "PostgreSQL JDBC /\nCopyManager" as PgDriver
+database PostgreSQL as PG
+participant ClickHouseClient as ChClient
+participant "Housepower\nNative JDBC" as ChDriver
+database ClickHouse as CH
+
+User -> App: --dataset --file\n--fetch-size --batch-size
+activate App
+App -> Pipeline: run(CliArgs)
+activate Pipeline
+
+Pipeline -> PgClient: new PostgresClient(settings)
+activate PgClient
+PgClient -> PgDriver: DriverManager.getConnection(...)
+activate PgDriver
+PgDriver -> PG: PostgreSQL wire protocol over TCP 5432
+
+Pipeline -> ChClient: new ClickHouseClient(settings)
+activate ChClient
+ChClient -> ChDriver: JDBC connection to clickhouse:9000
+activate ChDriver
+ChDriver -> CH: Native Protocol handshake over TCP
+
+Pipeline -> PgClient: prepareSource(args, metrics)
+PgClient -> PgClient: Read CSV header\nNormalize column names
+PgClient -> PG: CREATE SCHEMA / DROP TABLE / CREATE TABLE
+PgClient -> PgDriver: CopyManager.copyIn(COPY SQL, InputStream)
+PgDriver -> PG: Stream CSV through COPY FROM STDIN
+note right of PgClient
+  CSV is read as an InputStream.
+  The whole file is not loaded into RAM.
+end note
+PG --> PgDriver: COPY completed
+PgClient -> PG: SELECT count(*)
+PG --> PgClient: prepared row count
+PgClient --> Pipeline: source ready
+
+Pipeline -> PgClient: columns(sourceTable)
+PgClient -> PG: Read source column metadata
+PG --> PgClient: ordered column names
+PgClient --> Pipeline: columns
+
+Pipeline -> ChClient: createTarget(table, columns, truncate)
+ChClient -> ChDriver: execute(DROP/CREATE target)
+ChDriver -> CH: Native Protocol queries
+CH --> ChDriver: target ready
+ChClient -> ChDriver: prepareStatement(INSERT ... VALUES)
+
+Pipeline -> PgClient: readPages(..., fetch_size, consumer)
+PgClient -> PgDriver: prepareStatement(SELECT ... ORDER BY etl_row_num)
+PgClient -> PgDriver: setFetchSize(fetch_size)
+PgDriver -> PG: Execute streaming SELECT
+
+loop Until ResultSet is exhausted
+  PgClient -> PgDriver: ResultSet.next()
+  PgDriver -> PG: Fetch next network page when required
+  PG --> PgDriver: rows
+  PgClient --> Pipeline: page of at most fetch_size rows
+
+  loop Each batch_size slice of the page
+    Pipeline -> ChClient: writeBatch(rows, metrics)
+    ChClient -> ChDriver: set values and addBatch()
+    ChClient -> ChDriver: executeBatch()
+    ChDriver -> ChDriver: Encode compressed\ncolumnar native blocks
+    ChDriver -> CH: Native Protocol INSERT over TCP 9000
+    CH --> ChDriver: insert completed
+    ChDriver --> ChClient: batch result
+    ChClient --> Pipeline
+  end
+end
+
+PgClient -> PgDriver: close ResultSet / statement
+Pipeline -> ChClient: count(targetTable)
+ChClient -> ChDriver: executeQuery(SELECT count())
+ChDriver -> CH: Native Protocol query
+CH --> ChDriver: target row count
+ChClient --> Pipeline: target row count
+Pipeline -> Pipeline: Compare transferred rows\nwith target count
+
+Pipeline -> ChClient: insertMetrics(metrics)
+ChClient -> ChDriver: executeBatch/executeUpdate
+ChDriver -> CH: Native Protocol INSERT benchmark_runs
+CH --> ChDriver: metrics saved
+
+Pipeline -> ChClient: close()
+ChClient -> ChDriver: close native connection
+deactivate ChDriver
+deactivate ChClient
+Pipeline -> PgClient: close()
+PgClient -> PgDriver: close PostgreSQL connection
+deactivate PgDriver
+deactivate PgClient
+
+Pipeline --> App: Metrics
+deactivate Pipeline
+App --> User: JSON result
+deactivate App
+
+@enduml

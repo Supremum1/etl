@@ -23,7 +23,7 @@ class PostgresConfig:
 @dataclass(frozen=True)
 class ClickHouseConfig:
     host: str = os.getenv("CLICKHOUSE_HOST", "localhost")
-    port: int = int(os.getenv("CLICKHOUSE_PORT", "8123"))
+    port: int = int(os.getenv("CLICKHOUSE_PORT", "9000"))
     database: str = os.getenv("CLICKHOUSE_DATABASE", "olap_benchmark")
     user: str = os.getenv("CLICKHOUSE_USER", "default")
     password: str = os.getenv("CLICKHOUSE_PASSWORD", "")

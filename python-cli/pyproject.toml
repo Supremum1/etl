@@ -7,7 +7,7 @@ name = "etlbench"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-  "clickhouse-connect==0.7.19",
+  "clickhouse-driver[lz4]==0.2.10",
   "openpyxl==3.1.5",
   "psutil==6.1.0",
   "psycopg[binary]==3.2.3"

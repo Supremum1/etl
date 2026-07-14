@@ -8,15 +8,15 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-import clickhouse_connect
 import psutil
+from clickhouse_driver import Client
 
 from etlbench.config import ClickHouseConfig
 
 
 @dataclass
 class BenchmarkMetrics:
-    benchmark_version: int = 2
+    benchmark_version: int = 4
     benchmark_mode: str = "full"
     run_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     implementation: str = "python"
@@ -86,20 +86,27 @@ def process_cpu_ms() -> float:
     return (cpu.user + cpu.system) * 1000.0
 
 
-def insert_metrics(config: ClickHouseConfig, metrics: BenchmarkMetrics) -> None:
-    client = clickhouse_connect.get_client(
-        host=config.host,
-        port=config.port,
-        username=config.user,
-        password=config.password,
-        database=config.database,
-    )
-    client.command(f"CREATE DATABASE IF NOT EXISTS {config.database}")
-    client.command(
+def insert_metrics(
+    config: ClickHouseConfig,
+    metrics: BenchmarkMetrics,
+    client: Client | None = None,
+) -> None:
+    owns_client = client is None
+    if client is None:
+        client = Client(
+            host=config.host,
+            port=config.port,
+            user=config.user,
+            password=config.password,
+            database=config.database,
+            compression=True,
+        )
+    client.execute(f"CREATE DATABASE IF NOT EXISTS {config.database}")
+    client.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {config.database}.benchmark_runs
         (
-            benchmark_version UInt16 DEFAULT 2,
+            benchmark_version UInt16 DEFAULT 4,
             benchmark_mode LowCardinality(String),
             run_id UUID,
             measured_at DateTime64(3, 'UTC') DEFAULT now64(3),
@@ -133,16 +140,16 @@ def insert_metrics(config: ClickHouseConfig, metrics: BenchmarkMetrics) -> None:
         ORDER BY (dataset, implementation, measured_at, run_id)
         """
     )
-    client.command(
+    client.execute(
         f"ALTER TABLE {config.database}.benchmark_runs "
         "ADD COLUMN IF NOT EXISTS benchmark_version UInt16 DEFAULT 1"
     )
-    client.command(
+    client.execute(
         f"ALTER TABLE {config.database}.benchmark_runs "
         "ADD COLUMN IF NOT EXISTS benchmark_mode LowCardinality(String) DEFAULT 'legacy'"
     )
     for column in ("source_verify_ms", "target_setup_ms", "serialize_ms", "overhead_ms"):
-        client.command(
+        client.execute(
             f"ALTER TABLE {config.database}.benchmark_runs "
             f"ADD COLUMN IF NOT EXISTS {column} Float64 DEFAULT 0"
         )
@@ -177,4 +184,12 @@ def insert_metrics(config: ClickHouseConfig, metrics: BenchmarkMetrics) -> None:
         "cpu_ms",
         "extra_json",
     ]
-    client.insert("benchmark_runs", [[data[name] for name in ordered]], column_names=ordered)
+    try:
+        columns = ", ".join(ordered)
+        client.execute(
+            f"INSERT INTO benchmark_runs ({columns}) VALUES",
+            [[data[name] for name in ordered]],
+        )
+    finally:
+        if owns_client:
+            client.disconnect()

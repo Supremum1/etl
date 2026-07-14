@@ -24,7 +24,7 @@ SELECT
     round(cpu_ms, 2) AS cpu_ms,
     measured_at
 FROM olap_benchmark.benchmark_runs
-WHERE benchmark_version = 2 AND benchmark_mode IN ('full', 'transfer')
+WHERE benchmark_version = 4 AND benchmark_mode IN ('full', 'transfer')
 ORDER BY measured_at DESC
 LIMIT 20
 FORMAT PrettyCompact
@@ -47,7 +47,7 @@ SELECT
     batch_count,
     measured_at
 FROM olap_benchmark.benchmark_runs
-WHERE benchmark_version = 2 AND benchmark_mode IN ('full', 'transfer')
+WHERE benchmark_version = 4 AND benchmark_mode IN ('full', 'transfer')
 ORDER BY measured_at DESC
 LIMIT 20
 FORMAT PrettyCompact
